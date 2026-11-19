@@ -17,7 +17,7 @@ const KEY = {
 };
 const BACKUP_APP_ID = 'alice-budget';
 const APP_NAME = 'Alice 記帳';
-const APP_VERSION = 'v1.1';
+const APP_VERSION = 'v1.2';
 
 // --- Type Definitions ---
 type TxTag = 'need' | 'want' | 'advance' | 'income' | 'transfer';
@@ -55,10 +55,13 @@ interface Holding {
   quantity: number;             // 持有股數
   cost: number;                 // 投入成本（台幣）
   manualPrice?: number;         // 沒有試算表價格時，自己輸入的價格（台幣）
+  costUsd?: number;             // 起始成本用美金輸入時的金額；有值代表這檔用美金模式
+  costFx?: number;              // 換算起始成本用的匯率（台幣／美元）
 }
 
 interface MarketData {
   prices: { [key: string]: number };
+  fx?: { [key: string]: number };   // 試算表的 fx_ 列，例如 fx_USDTWD
   fetchedAt: string;
 }
 
@@ -137,20 +140,21 @@ const formatMoney = (amount: number) => amount.toLocaleString(undefined, { maxim
 const signedMoney = (v: number) => `${v >= 0 ? '+' : '−'}$${formatMoney(Math.abs(v))}`;
 const tagLabel = (tag: TxTag) => tag === 'need' ? '需要' : tag === 'want' ? '想要' : tag === 'advance' ? '代墊' : '';
 
-const EMPTY_MARKET: MarketData = { prices: {}, fetchedAt: '' };
+const EMPTY_MARKET: MarketData = { prices: {}, fx: {}, fetchedAt: '' };
 
 // 讀取試算表 Export 的兩欄 CSV，只取 price_ 開頭的資料
 const parseMarketCsv = (text: string): MarketData => {
-  const data: MarketData = { prices: {}, fetchedAt: new Date().toISOString() };
+  const data: MarketData = { prices: {}, fx: {}, fetchedAt: new Date().toISOString() };
   text.split(/\r?\n/).forEach(line => {
     const m = line.match(/^\s*"?([^",]+)"?\s*,\s*(.*)$/);
     if (!m) return;
     const key = m[1].trim();
-    if (!key.startsWith('price_')) return;
+    if (!key.startsWith('price_') && !key.startsWith('fx_')) return;
     let raw = m[2].trim().replace(/^"|"$/g, '').trim().replace(/,/g, '');
     const value = Number(raw);
     if (raw === '' || !isFinite(value)) return;
-    data.prices[key.slice(6)] = value;
+    if (key.startsWith('fx_')) data.fx![key.slice(3)] = value;
+    else data.prices[key.slice(6)] = value;
   });
   return data;
 };
@@ -1446,6 +1450,7 @@ export default function App() {
       categories: '分類與預算', ratio: '結餘分配', goals: '夢想帳戶', initial: '起始數值', installments: '分期付款',
       holdings: '持倉', market: '市場價格', reconcile: '餘額校正', backup: '備份與匯入',
     };
+    const sheetFx = market.fx?.USDTWD;
     const updateHolding = (idx: number, patch: Partial<Holding>) => setHoldings(holdings.map((h, i) => (i === idx ? { ...h, ...patch } : h)));
     const decimalRow = (key: string, label: string, current: number | undefined, apply: (n: number) => void, placeholder = '0') => (
       <InputRow label={label} inputMode="decimal" placeholder={placeholder}
@@ -1572,7 +1577,35 @@ export default function App() {
                     </div>
                     <CardContainer className="divide-y divide-gray-100">
                       {decimalRow(`${h.name}:qty`, '起始股數', h.quantity, n => updateHolding(idx, { quantity: n }))}
-                      <InputRow label="起始成本" value={h.cost || ''} onChange={v => { if (/^\d*$/.test(v)) updateHolding(idx, { cost: Number(v) || 0 }); }} />
+                      <div className="px-4 py-3 flex items-center justify-between">
+                        <span className="text-base text-black">成本幣別</span>
+                        <div className="flex bg-gray-100 p-0.5 rounded-lg">
+                          {(['TWD', 'USD'] as const).map(c => {
+                            const on = (h.costUsd !== undefined) === (c === 'USD');
+                            return (
+                              <button key={c} onClick={() => {
+                                if (on) return;
+                                if (c === 'USD') { const fx = h.costFx || sheetFx || 0; updateHolding(idx, { costUsd: fx > 0 && h.cost ? Math.round((h.cost / fx) * 100) / 100 : 0, costFx: fx || undefined }); }
+                                else updateHolding(idx, { costUsd: undefined, costFx: undefined });
+                                setNumDrafts(prev => { const n = { ...prev }; delete n[`${h.name}:usd`]; delete n[`${h.name}:fx`]; return n; });
+                              }} className={`px-3 py-1 text-xs font-bold rounded-md transition ${on ? 'bg-white shadow-sm text-black' : 'text-gray-400'}`}>{c === 'TWD' ? '台幣' : '美金'}</button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      {h.costUsd === undefined ? (
+                        <InputRow label="起始成本" value={h.cost || ''} onChange={v => { if (/^\d*$/.test(v)) updateHolding(idx, { cost: Number(v) || 0 }); }} />
+                      ) : (() => {
+                        const fx = h.costFx || sheetFx || 0;
+                        const apply = (usd: number, rate: number) => updateHolding(idx, { costUsd: usd, costFx: rate || undefined, cost: rate > 0 ? Math.round(usd * rate) : 0 });
+                        return (
+                          <>
+                            {decimalRow(`${h.name}:usd`, '起始成本（美金）', h.costUsd, n => apply(n, fx))}
+                            {decimalRow(`${h.name}:fx`, '匯率（台幣／美元）', fx, n => apply(h.costUsd || 0, n), sheetFx ? String(sheetFx) : '例如 31.5')}
+                            <div className="px-4 py-3 flex justify-between"><span className="text-base text-black">換算台幣成本</span><span className="text-base tabular-nums font-bold">{fx > 0 ? `$${formatMoney(h.cost)}` : '請輸入匯率'}</span></div>
+                          </>
+                        );
+                      })()}
                       {eff && eff.bought > 0 && (
                         <div className="px-4 py-3 flex justify-between"><span className="text-base text-black">目前（含 {eff.bought} 筆買進）</span><span className="text-base tabular-nums text-gray-600">{eff.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })} 股・${formatMoney(eff.cost)}</span></div>
                       )}
